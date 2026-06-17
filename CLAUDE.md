@@ -85,7 +85,8 @@ also exposes an HTTP API the listener could hit directly.
 | `serve.py` | Static server **and** queue owner (stdlib only). NOT web-exposed. |
 | `player/youtube-fullscreen.html` | The page. Only files under `player/` are web-exposed. |
 | `~/kiosk-state/queue.json` | The queue, persisted. Kept OUTSIDE the repo. |
-| `~/.kiosk-firefox/` | Dedicated Firefox profile (autoplay-with-sound enabled). |
+| `kiosk-firefox/user.js` | Canonical profile prefs, in the repo. Source of truth. |
+| `~/.kiosk-firefox/` | Live Firefox profile (autoplay-with-sound enabled). Seeded from `kiosk-firefox/user.js`; rest is disposable runtime state. |
 
 ### The queue is server-owned (single source of truth)
 
@@ -142,6 +143,14 @@ queue and the already-open page picks it up via polling. No browser remote-contr
   That's bypassed here because we control the browser launch: `--kiosk` gives
   real fullscreen, and the `~/.kiosk-firefox` profile's `user.js` sets
   `media.autoplay.default=0`. (On a normal web page neither would be allowed.)
+- **The kiosk profile is repo-provisioned.** `~/.kiosk-firefox` is otherwise
+  unmanaged (Firefox fills it with caches/history on first run); the only part
+  we own is `user.js`. `play-video.sh` runs `mkdir -p` on the profile and copies
+  `kiosk-firefox/user.js` in **when the live profile lacks it**, so the profile
+  is reproducible after a wipe or on a fresh Pi. Because it seeds only when
+  missing, editing the repo `user.js` won't update an existing profile until its
+  `user.js` is deleted. Firefox re-applies `user.js` on every startup, so the
+  prefs can't drift once seeded.
 - **No mouse/keyboard on the Pi** — everything is driven from SSH. The page has
   no clickable UI; control is entirely via the queue API.
 - **Embedding-disabled videos** show "video unavailable" — that's the video
