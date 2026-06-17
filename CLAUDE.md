@@ -61,14 +61,54 @@ The PN532 chip does not report RSSI or signal strength. `InListPassiveTarget`
 only returns UID, SAK, ATQA — no proximity metric. This is a hardware
 limitation, not a library gap.
 
-## Running
+## Tags store a YouTube video_id
+
+Each tag holds a YouTube `video_id` as a **NUL-padded ASCII payload** (not just a
+UID lookup). The on-tag layout is the single source of truth in `tag_payload.py`,
+imported by both the writer and the listener so they can't drift:
+
+- 16 bytes, ASCII, NUL-padded (an 11-char id leaves 5 NUL bytes).
+- Tag family auto-detected by **UID length**: 4 bytes → MIFARE Classic (payload
+  in **block 4**, authenticated with the factory default key `FF…FF`); 7 bytes →
+  NTAG2xx (payload in **pages 4–7**).
+- Only data blocks/pages are touched — never sector trailers (Classic) or
+  lock/config pages (NTAG) — so a tag can't be bricked or locked read-only, and
+  is safe to rewrite (~100k-cycle flash endurance).
+
+### Writing a tag — `write_tag.py`
+
+Writing is pinned to the **ttyAMA0 HAT only** (`reset=20`). One tag at a time:
+
+```bash
+cd /home/andy/nfchax
+./venv/bin/python write_tag.py dQw4w9WgXcQ      # hold ONE tag on the HAT reader
+```
+
+Waits up to 30s (`--timeout`) for a tag, writes the id, then reads it back and
+verifies — a half-write fails loudly instead of leaving a corrupt tag. Calls
+`GPIO.cleanup()` on exit.
+
+### Reading — `nfc_listener.py`
 
 ```bash
 cd /home/andy/nfchax
 ./venv/bin/python nfc_listener.py
 ```
 
-Output format: `[2026-06-16T13:41:41] reader=ttyUSB0 uid=ca32b1d5`
+Listens on all three readers; on a scan it reads the payload back and prints the
+`video_id`. The payload is read **once per tag placement** (UID debounce), not on
+every poll. A read/auth failure or a blank tag is reported but keeps the reader
+alive. Output format:
+
+```
+[2026-06-16T23:09:51] reader=ttyAMA0 video_id=dQw4w9WgXcQ
+[2026-06-16T23:10:04] reader=ttyUSB0 uid=ca32b1d5 (no video_id on tag)
+[2026-06-16T23:10:12] reader=ttyUSB1 uid=047e2e… payload_error=...
+```
+
+Reading needs no reset pin, so all readers can read; only *writing* is pinned to
+ttyAMA0. The listener does **not** yet drive playback — wiring a scan to
+`play-video.sh` / the `/enqueue` API is the remaining seam.
 
 ## Fullscreen YouTube player (kiosk)
 
