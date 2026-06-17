@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>YouTube Fullscreen Autoplay</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+
+    /* Player fills the viewport so it reads as fullscreen even before
+       the real Fullscreen API kicks in on first interaction. */
+    #player-wrap {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+    }
+    #player {
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
+
+    /* Opaque cover shown when a video ends — hides YouTube's end screen
+       (recommendations) without looping the video. */
+    #end-cover {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      background: #000;
+      display: none;
+    }
+    #end-cover.show {
+      display: block;
+    }
+
+  </style>
+</head>
+<body>
+  <div id="player-wrap">
+    <div id="player"></div>
+  </div>
+  <div id="end-cover"></div>
+
+  <script>
+    // ---- Config -------------------------------------------------------------
+    const STATE_URL = "current_video.txt"; // file the control script writes to
+    const FALLBACK_ID = "Y1ujpoDlgRU";      // used if the state file is missing
+    const POLL_MS = 2000;                   // how often to check for a new video
+    // ------------------------------------------------------------------------
+
+    let player;
+    let currentId = null;
+
+    // Read the desired video id from the state file the control script writes.
+    async function fetchDesiredId() {
+      try {
+        const r = await fetch(STATE_URL, { cache: "no-store" });
+        if (!r.ok) return null;
+        const id = (await r.text()).trim();
+        return id || null;
+      } catch {
+        return null;
+      }
+    }
+
+    function play(target) {
+      target.unMute();
+      target.setVolume(100);
+      target.playVideo();
+    }
+
+    // 1) Load the IFrame API.
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    document.head.appendChild(tag);
+
+    // 2) The API calls this global automatically once it has loaded.
+    window.onYouTubeIframeAPIReady = async function () {
+      currentId = (await fetchDesiredId()) || FALLBACK_ID;
+      player = new YT.Player("player", {
+        videoId: currentId,
+        playerVars: {
+          autoplay: 1,        // autoplay on load
+          mute: 0,            // sound on — Firefox kiosk profile allows autoplay
+          controls: 0,        // hide player controls
+          rel: 0,             // limit end recommendations to same channel
+          modestbranding: 1,  // reduce branding (logo still appears)
+          playsinline: 1,     // inline on iOS rather than native player
+          fs: 1,              // allow the fullscreen button / API
+          iv_load_policy: 3,  // no annotations
+          disablekb: 1,       // ignore keyboard controls
+          origin: location.origin, // required: valid web origin for the embed
+        },
+        events: {
+          onReady: (e) => play(e.target),
+          onStateChange: onStateChange,
+        },
+      });
+
+      // 3) Poll the state file; swap the video in place when it changes.
+      setInterval(async () => {
+        const id = await fetchDesiredId();
+        if (id && id !== currentId) {
+          currentId = id;
+          document.getElementById("end-cover").classList.remove("show"); // reveal player
+          player.loadVideoById(id); // smooth switch, no page reload
+          play(player);
+        }
+      }, POLL_MS);
+    };
+
+    // When the video ends, stop and cover the player with a black screen so
+    // YouTube's end-screen recommendations never appear (and it doesn't loop).
+    function onStateChange(e) {
+      if (e.data === YT.PlayerState.ENDED) {
+        document.getElementById("end-cover").classList.add("show");
+      }
+    }
+  </script>
+</body>
+</html>
