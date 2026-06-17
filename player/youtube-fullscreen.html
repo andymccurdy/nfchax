@@ -3,17 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>YouTube Fullscreen Autoplay</title>
+  <title>YouTube Fullscreen Queue Player</title>
   <style>
     html, body {
       margin: 0;
       height: 100%;
       background: #000;
       overflow: hidden;
+      font-family: system-ui, sans-serif;
     }
 
-    /* Player fills the viewport so it reads as fullscreen even before
-       the real Fullscreen API kicks in on first interaction. */
+    /* Player fills the viewport (kiosk mode is already fullscreen). */
     #player-wrap {
       position: fixed;
       inset: 0;
@@ -26,102 +26,219 @@
       border: 0;
     }
 
-    /* Opaque cover shown when a video ends — hides YouTube's end screen
-       (recommendations) without looping the video. */
+    /* Opaque cover shown when the queue is empty — hides the YouTube end
+       screen (recommendations) and the blank player. */
     #end-cover {
       position: fixed;
       inset: 0;
-      z-index: 20;
+      z-index: 30;
       background: #000;
       display: none;
     }
-    #end-cover.show {
-      display: block;
-    }
+    #end-cover.show { display: block; }
 
+    /* Horizontal queue overlay along the bottom. Appears whenever the queue
+       changes, then auto-hides. */
+    #queue-bar {
+      position: fixed;
+      left: 0; right: 0; bottom: 0;
+      z-index: 20;
+      display: flex;
+      gap: 14px;
+      padding: 22px 18px 18px;
+      justify-content: center;
+      align-items: flex-end;
+      background: linear-gradient(to top, rgba(0,0,0,0.85), rgba(0,0,0,0));
+      opacity: 0;
+      transform: translateY(24px);
+      transition: opacity .4s ease, transform .4s ease;
+      pointer-events: none;
+    }
+    #queue-bar.show { opacity: 1; transform: translateY(0); }
+
+    .tile {
+      position: relative;
+      flex: 0 0 auto;
+      width: 168px;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #111;
+      box-shadow: 0 4px 16px rgba(0,0,0,.65);
+      opacity: 0.78;
+      transition: opacity .3s ease, outline-color .3s ease;
+    }
+    .tile img {
+      display: block;
+      width: 100%;
+      height: 94px;
+      object-fit: cover;
+    }
+    .tile.playing {
+      opacity: 1;
+      outline: 3px solid #fff;
+    }
+    .tile .badge {
+      position: absolute;
+      top: 6px; left: 6px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      background: rgba(0,0,0,.72);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .02em;
+    }
+    .tile.playing .badge { background: #c00; }
   </style>
 </head>
 <body>
   <div id="player-wrap">
     <div id="player"></div>
   </div>
+  <div id="queue-bar"></div>
   <div id="end-cover"></div>
 
   <script>
     // ---- Config -------------------------------------------------------------
-    const STATE_URL = "current_video.txt"; // file the control script writes to
-    const FALLBACK_ID = "Y1ujpoDlgRU";      // used if the state file is missing
-    const POLL_MS = 2000;                   // how often to check for a new video
+    const QUEUE_URL   = "/queue";       // GET  -> {queue: [...]}
+    const ADVANCE_URL = "/advance";     // POST -> pops the finished head
+    const POLL_MS     = 2000;           // how often to re-read the queue
+    const OVERLAY_MS  = 5000;           // how long the queue bar stays visible
+    const thumb = (id) => `https://img.youtube.com/vi/${id}/mqdefault.jpg`;
     // ------------------------------------------------------------------------
 
     let player;
-    let currentId = null;
+    let playingId = null;     // video id currently loaded in the player (queue head)
+    let lastQueueKey = null;  // serialised last-seen queue, for change detection
+    let advancing = false;    // guard so ENDED only advances once
+    let overlayTimer = null;
 
-    // Read the desired video id from the state file the control script writes.
-    async function fetchDesiredId() {
+    // --- queue I/O -----------------------------------------------------------
+    async function fetchQueue() {
       try {
-        const r = await fetch(STATE_URL, { cache: "no-store" });
+        const r = await fetch(QUEUE_URL, { cache: "no-store" });
         if (!r.ok) return null;
-        const id = (await r.text()).trim();
-        return id || null;
+        const j = await r.json();
+        return Array.isArray(j.queue) ? j.queue : [];
       } catch {
-        return null;
+        return null; // server hiccup — leave state alone, retry next poll
       }
     }
 
-    function play(target) {
-      target.unMute();
-      target.setVolume(100);
-      target.playVideo();
+    // Reconcile UI + playback against a queue snapshot. Safe to call from both
+    // the poll loop and the advance handler.
+    function applyQueue(q) {
+      // 1) Show the overlay whenever the queue contents change.
+      const key = JSON.stringify(q);
+      if (key !== lastQueueKey) {
+        lastQueueKey = key;
+        renderQueueBar(q);
+        if (q.length > 0) flashOverlay();
+      }
+
+      // 2) Make the player match the head of the queue.
+      const head = q.length ? q[0] : null;
+      if (head === null) {
+        if (playingId !== null) {
+          playingId = null;
+          try { player.stopVideo(); } catch {}
+        }
+        setEndCover(true); // empty queue -> black screen
+      } else if (head !== playingId) {
+        playingId = head;
+        setEndCover(false);
+        player.loadVideoById(head);
+        player.unMute();
+        player.setVolume(100);
+        player.playVideo();
+      }
     }
 
-    // 1) Load the IFrame API.
+    async function poll() {
+      const q = await fetchQueue();
+      if (q !== null) applyQueue(q);
+    }
+
+    async function advance() {
+      if (advancing) return;
+      advancing = true;
+      try {
+        const r = await fetch(ADVANCE_URL, { method: "POST" });
+        if (r.ok) {
+          const j = await r.json();
+          applyQueue(Array.isArray(j.queue) ? j.queue : []);
+        }
+      } catch {
+        /* next poll will reconcile */
+      } finally {
+        advancing = false;
+      }
+    }
+
+    // --- overlay rendering ---------------------------------------------------
+    function renderQueueBar(q) {
+      const bar = document.getElementById("queue-bar");
+      bar.innerHTML = "";
+      q.forEach((id, i) => {
+        const tile = document.createElement("div");
+        tile.className = "tile" + (i === 0 ? " playing" : "");
+
+        const img = document.createElement("img");
+        img.src = thumb(id);
+        img.alt = id;
+
+        const badge = document.createElement("div");
+        badge.className = "badge";
+        badge.textContent = i === 0 ? "▶ now" : String(i);
+
+        tile.append(img, badge);
+        bar.appendChild(tile);
+      });
+    }
+
+    function flashOverlay() {
+      const bar = document.getElementById("queue-bar");
+      bar.classList.add("show");
+      if (overlayTimer) clearTimeout(overlayTimer);
+      overlayTimer = setTimeout(() => bar.classList.remove("show"), OVERLAY_MS);
+    }
+
+    function setEndCover(on) {
+      document.getElementById("end-cover").classList.toggle("show", on);
+    }
+
+    // --- YouTube IFrame API --------------------------------------------------
     const tag = document.createElement("script");
     tag.src = "https://www.youtube.com/iframe_api";
     document.head.appendChild(tag);
 
-    // 2) The API calls this global automatically once it has loaded.
-    window.onYouTubeIframeAPIReady = async function () {
-      currentId = (await fetchDesiredId()) || FALLBACK_ID;
+    window.onYouTubeIframeAPIReady = function () {
       player = new YT.Player("player", {
-        videoId: currentId,
+        // No initial videoId — the queue decides what plays.
         playerVars: {
-          autoplay: 1,        // autoplay on load
-          mute: 0,            // sound on — Firefox kiosk profile allows autoplay
-          controls: 0,        // hide player controls
-          rel: 0,             // limit end recommendations to same channel
-          modestbranding: 1,  // reduce branding (logo still appears)
-          playsinline: 1,     // inline on iOS rather than native player
-          fs: 1,              // allow the fullscreen button / API
-          iv_load_policy: 3,  // no annotations
-          disablekb: 1,       // ignore keyboard controls
-          origin: location.origin, // required: valid web origin for the embed
+          autoplay: 1,
+          mute: 0,            // Firefox kiosk profile allows autoplay-with-sound
+          controls: 0,
+          rel: 0,
+          modestbranding: 1,
+          playsinline: 1,
+          fs: 1,
+          iv_load_policy: 3,
+          disablekb: 1,
+          origin: location.origin, // valid web origin required for the embed
         },
         events: {
-          onReady: (e) => play(e.target),
-          onStateChange: onStateChange,
+          onReady: () => {
+            setEndCover(true);          // black until the first video loads
+            poll();                     // load whatever is already queued
+            setInterval(poll, POLL_MS); // and watch for changes
+          },
+          onStateChange: (e) => {
+            if (e.data === YT.PlayerState.ENDED) advance();
+          },
         },
       });
-
-      // 3) Poll the state file; swap the video in place when it changes.
-      setInterval(async () => {
-        const id = await fetchDesiredId();
-        if (id && id !== currentId) {
-          currentId = id;
-          document.getElementById("end-cover").classList.remove("show"); // reveal player
-          player.loadVideoById(id); // smooth switch, no page reload
-          play(player);
-        }
-      }, POLL_MS);
     };
-
-    // When the video ends, stop and cover the player with a black screen so
-    // YouTube's end-screen recommendations never appear (and it doesn't loop).
-    function onStateChange(e) {
-      if (e.data === YT.PlayerState.ENDED) {
-        document.getElementById("end-cover").classList.add("show");
-      }
-    }
   </script>
 </body>
 </html>
