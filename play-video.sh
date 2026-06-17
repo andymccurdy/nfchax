@@ -55,7 +55,18 @@ else
   exit 1
 fi
 
-# 3) Launch Firefox only if it isn't already running.
+# 3) Ensure the kiosk Firefox profile exists and carries our prefs. The profile
+#    is otherwise unmanaged (Firefox fills it with caches/history on first run);
+#    user.js is the only part we own, and Firefox re-applies it every startup.
+#    Seed it from the repo copy when the live profile is missing it.
+PROFILE_USERJS_SRC="$APP_DIR/kiosk-firefox/user.js"
+mkdir -p "$PROFILE"
+if [[ ! -f "$PROFILE/user.js" ]]; then
+  cp "$PROFILE_USERJS_SRC" "$PROFILE/user.js"
+  echo "Provisioned kiosk profile prefs at $PROFILE/user.js"
+fi
+
+# 4) Launch Firefox only if it isn't already running.
 if pgrep firefox >/dev/null; then
   echo "Firefox already running — the open page will pick up the new queue."
 else
