@@ -10,6 +10,37 @@ Three PN532 NFC readers connected via UART on a Raspberry Pi 5:
 | `/dev/ttyUSB0` | Plain PN532 module via CH340 USB-serial adapter | None (not wired) |
 | `/dev/ttyUSB1` | Plain PN532 module via CH340 USB-serial adapter | None (not wired) |
 
+## Configuring which readers are connected (`NFC_READERS`)
+
+The set of readers is **not** hardcoded — both `nfc_listener.py` and
+`write_tag.py` read it from the `NFC_READERS` env var via `readers.py` (single
+source of truth). Format: comma-separated `NAME=DEVICE[:RESET_PIN]`. The
+`RESET_PIN` is a BCM GPIO pin; omit it for plain USB modules (no reset line).
+
+Default (this Pi — HAT + two USB modules), used when `NFC_READERS` is unset:
+
+```
+ttyAMA0=/dev/ttyAMA0:20,ttyUSB0=/dev/ttyUSB0,ttyUSB1=/dev/ttyUSB1
+```
+
+A developer with **only the two USB readers and no HAT** sets:
+
+```bash
+export NFC_READERS=ttyUSB0=/dev/ttyUSB0,ttyUSB1=/dev/ttyUSB1
+```
+
+This stops the listener from spamming connection errors for an absent ttyAMA0,
+and makes the writer default to the first reader (`ttyUSB0`). The listener also
+accepts repeatable `--reader NAME=DEVICE[:RESET]` flags to add/override a single
+reader on top of the env set.
+
+You don't have to write the var by hand: `one_time_setup.py` **probes** the
+serial ports (constructing a `PN532_UART` is the firmware handshake, so only a
+reader that actually answers is counted — a bare `/dev/ttyAMA0` UART node with no
+HAT is correctly skipped) and writes the detected `NFC_READERS` line into
+`~/.bashrc`. That script also bootstraps `./venv` and re-execs under it, so on a
+fresh clone just run `python3 one_time_setup.py`.
+
 ## Important: ttyAMA0 is correct on this Pi 5
 
 `/dev/ttyAMA0` is the correct device for the GPIO-header UART on this board.
@@ -77,11 +108,14 @@ imported by both the writer and the listener so they can't drift:
 
 ### Writing a tag — `write_tag.py`
 
-Writing is pinned to the **ttyAMA0 HAT only** (`reset=20`). One tag at a time:
+Writes one tag at a time on a single reader. By default it uses the **first
+reader in `NFC_READERS`** (the ttyAMA0 HAT with `reset=20` on this Pi); override
+with `--device`/`--reset` to write on any reader:
 
 ```bash
-cd /home/andy/nfchax
-./venv/bin/python write_tag.py dQw4w9WgXcQ      # hold ONE tag on the HAT reader
+cd ~/nfchax
+./venv/bin/python write_tag.py dQw4w9WgXcQ                              # default reader
+./venv/bin/python write_tag.py --device /dev/ttyUSB0 --reset none ID    # a USB reader, no HAT
 ```
 
 Waits up to 30s (`--timeout`) for a tag, writes the id, then reads it back and
@@ -91,11 +125,11 @@ verifies — a half-write fails loudly instead of leaving a corrupt tag. Calls
 ### Reading — `nfc_listener.py`
 
 ```bash
-cd /home/andy/nfchax
+cd ~/nfchax
 ./venv/bin/python nfc_listener.py
 ```
 
-Listens on all three readers; on a scan it reads the payload back and prints the
+Listens on every reader in `NFC_READERS`; on a scan it reads the payload back and prints the
 `video_id`. The payload is read **once per tag placement** (UID debounce), not on
 every poll. A read/auth failure or a blank tag is reported but keeps the reader
 alive. Output format:
@@ -106,8 +140,8 @@ alive. Output format:
 [2026-06-16T23:10:12] reader=ttyUSB1 uid=047e2e… payload_error=...
 ```
 
-Reading needs no reset pin, so all readers can read; only *writing* is pinned to
-ttyAMA0. The listener does **not** yet drive playback — wiring a scan to
+Reading needs no reset pin, so all readers can read; *writing* defaults to the
+first reader but works on any. The listener does **not** yet drive playback — wiring a scan to
 `play-video.sh` / the `/enqueue` API is the remaining seam.
 
 ## Fullscreen YouTube player (kiosk)
@@ -200,8 +234,9 @@ queue and the already-open page picks it up via polling. No browser remote-contr
 ### Launch environment
 
 Firefox is launched from SSH against the local Wayland session (labwc), so the
-script exports `XDG_RUNTIME_DIR=/run/user/1000`, `WAYLAND_DISPLAY=wayland-0`,
-`DISPLAY=:0`, `MOZ_ENABLE_WAYLAND=1`. UID is 1000.
+script exports `XDG_RUNTIME_DIR=/run/user/$(id -u)`, `WAYLAND_DISPLAY=wayland-0`,
+`DISPLAY=:0`, `MOZ_ENABLE_WAYLAND=1`. The runtime dir is derived from the current
+user's UID rather than hardcoded, so it works regardless of which user runs it.
 
 The server and browser do NOT survive a reboot (no systemd service, by choice).
 After a reboot, just run `play-video.sh ...` again — it bootstraps everything

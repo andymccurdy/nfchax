@@ -16,16 +16,8 @@ import threading
 import time
 
 from pn532.uart import PN532_UART
+from readers import get_readers, parse_reader
 from tag_payload import decode_payload, read_payload
-
-# reader name -> (device path, reset GPIO pin or None)
-# Only the ttyAMA0 reader is the Waveshare HAT with a wired reset pin (GPIO20).
-# The ttyUSB0/ttyUSB1 readers are plain PN532 modules with no reset line.
-READERS = {
-    "ttyAMA0": ("/dev/ttyAMA0", 20),
-    "ttyUSB0": ("/dev/ttyUSB0", None),
-    "ttyUSB1": ("/dev/ttyUSB1", None),
-}
 
 POLL_TIMEOUT = 0.5  # seconds per read_passive_target call
 DEBOUNCE_SECONDS = 1.0
@@ -87,15 +79,17 @@ def main():
         action="append",
         dest="readers",
         metavar="NAME=DEVICE[:RESET_PIN]",
-        help="Override a reader, e.g. ttyUSB0=/dev/ttyUSB0 or ttyAMA0=/dev/ttyAMA0:20. Repeatable.",
+        help="Add/override a reader on top of the NFC_READERS set, e.g. "
+             "ttyUSB0=/dev/ttyUSB0 or ttyAMA0=/dev/ttyAMA0:20. Repeatable.",
     )
     args = parser.parse_args()
 
-    readers = dict(READERS)
+    # Base set comes from NFC_READERS (or the default Pi setup); --reader
+    # overrides individual readers by name on top of it.
+    readers = get_readers()
     for override in args.readers or []:
-        name, _, rest = override.partition("=")
-        device, _, pin = rest.partition(":")
-        readers[name] = (device, int(pin) if pin else None)
+        name, device, pin = parse_reader(override)
+        readers[name] = (device, pin)
 
     stop_event = threading.Event()
     threads = [

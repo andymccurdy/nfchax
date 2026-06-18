@@ -9,11 +9,10 @@
 #
 set -uo pipefail
 
-HOME_DIR="/home/andy"
-APP_DIR="$HOME_DIR/nfchax"               # repo root (serve.py lives here)
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # repo root (this script lives here)
 WEB_ROOT="$APP_DIR/player"               # ONLY this dir is exposed by the web server
-STATE_DIR="$HOME_DIR/kiosk-state"        # queue.json lives here, OUT of the source tree
-PROFILE="$HOME_DIR/.kiosk-firefox"
+STATE_DIR="$HOME/kiosk-state"            # queue.json lives here, OUT of the source tree
+PROFILE="$HOME/.kiosk-firefox"
 PORT=8000
 URL="http://127.0.0.1:${PORT}/youtube-fullscreen.html"
 
@@ -45,7 +44,7 @@ for _ in $(seq 1 50); do
 done
 
 # 3) Launch Firefox in kiosk mode (same Wayland env as play-video.sh).
-export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export WAYLAND_DISPLAY=wayland-0
 export DISPLAY=:0
 export MOZ_ENABLE_WAYLAND=1

@@ -2,17 +2,18 @@
 """Drive the kiosk queue from the NFC tags physically on the readers.
 
 Reads each present tag's video_id and assembles a comma-separated queue string
-in a FIXED order — ttyUSB0, ttyAMA0, ttyUSB1 — exactly as play-video.sh expects.
-A reader with no tag, no payload, or no response within the poll timeout is
-simply omitted. Whenever the assembled string changes, play-video.sh is called
-once to replace the kiosk queue. Removing every tag empties the queue (via
-serve.py's /replace), which stops playback and blacks out the screen —
-play-video.sh can't express an empty queue, so we hit the server's API directly.
+in the order the readers are listed in NFC_READERS (see readers.py), exactly as
+play-video.sh expects. A reader with no tag, no payload, or no response within
+the poll timeout is simply omitted. Whenever the assembled string changes,
+play-video.sh is called once to replace the kiosk queue. Removing every tag
+empties the queue (via serve.py's /replace), which stops playback and blacks out
+the screen — play-video.sh can't express an empty queue, so we hit the server's
+API directly.
 
 Multiplexed polling:
-    Each reader is polled by its OWN thread, so the three reads happen in
-    parallel rather than one after another. An all-empty round therefore costs
-    ~POLL_TIMEOUT (~0.5s) of wall-clock, not 3x that, and the main loop never
+    Each reader is polled by its OWN thread, so the reads happen in parallel
+    rather than one after another. An all-empty round therefore costs
+    ~POLL_TIMEOUT (~0.5s) of wall-clock, not N times that, and the main loop never
     blocks on a serial read at all — it just snapshots each thread's latest
     debounced result every EVAL_PAUSE and acts on changes. (PN532 construction
     touches RPi.GPIO, which isn't thread-safe, so it's serialised with a lock;
@@ -32,6 +33,7 @@ the same time (they can't both open the same UART).
 
 import argparse
 import datetime
+import os
 import signal
 import subprocess
 import threading
@@ -41,23 +43,14 @@ import urllib.request
 import RPi.GPIO as GPIO
 
 from pn532.uart import PN532_UART
+from readers import get_readers
 from tag_payload import decode_payload, read_payload
 
-PLAY_VIDEO = "/home/andy/nfchax/play-video.sh"
+# play-video.sh sits alongside this script in the repo checkout.
+PLAY_VIDEO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "play-video.sh")
 # serve.py listens here (play-video.sh hardcodes the same port). /replace with an
 # empty body atomically empties the queue.
 REPLACE_URL = "http://127.0.0.1:8000/replace"
-
-# The order ids are concatenated into the queue string (per the spec).
-READER_ORDER = ["ttyUSB0", "ttyAMA0", "ttyUSB1"]
-
-# name -> (device path, reset GPIO pin or None). Only the ttyAMA0 HAT has a
-# wired reset line (GPIO 20); the USB modules don't.
-READERS = {
-    "ttyAMA0": ("/dev/ttyAMA0", 20),
-    "ttyUSB0": ("/dev/ttyUSB0", None),
-    "ttyUSB1": ("/dev/ttyUSB1", None),
-}
 
 POLL_TIMEOUT = 0.5      # seconds a single read_passive_target waits for a tag
 POLL_PAUSE = 0.05       # breather per reader poll (caps re-read rate when a tag is present)
@@ -168,10 +161,16 @@ def main():
                         help="log the assembled queue string but never call play-video.sh")
     args = parser.parse_args()
 
+    # Readers (and their concatenation order) come from NFC_READERS; see readers.py.
+    readers = get_readers()
+    if not readers:
+        parser.error("no readers configured — set NFC_READERS (see readers.py)")
+    reader_order = list(readers)
+
     stop_event = threading.Event()
     lock = threading.Lock()
     gpio_lock = threading.Lock()
-    results = {name: None for name in READER_ORDER}
+    results = {name: None for name in reader_order}
 
     # Stop cleanly (run GPIO.cleanup) on Ctrl-C and SIGTERM so service managers /
     # `timeout` can shut it down. A wedged serial read can still block a reader
@@ -179,14 +178,14 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
 
-    threads = [ReaderThread(name, *READERS[name], results, lock, gpio_lock, stop_event)
-               for name in READER_ORDER]
+    threads = [ReaderThread(name, *readers[name], results, lock, gpio_lock, stop_event)
+               for name in reader_order]
     for t in threads:
         t.start()
 
     last_sent = None  # sentinel: distinct from "" so the first cycle always syncs
     prev = dict(results)
-    log(f"Driving queue from readers (order: {', '.join(READER_ORDER)})"
+    log(f"Driving queue from readers (order: {', '.join(reader_order)})"
         + (" [dry-run]" if args.dry_run else ""))
     try:
         while not stop_event.is_set():
@@ -195,12 +194,12 @@ def main():
 
             # Log per-reader presence transitions — handy for watching the
             # debounce cope with a fidgety tag.
-            for name in READER_ORDER:
+            for name in reader_order:
                 if snapshot[name] != prev[name]:
                     log(f"reader={name} tag: {prev[name]!r} -> {snapshot[name]!r}")
             prev = snapshot
 
-            queue_str = ",".join(snapshot[n] for n in READER_ORDER if snapshot[n])
+            queue_str = ",".join(snapshot[n] for n in reader_order if snapshot[n])
             if queue_str != last_sent:
                 if args.dry_run:
                     log(f"queue -> {queue_str!r} (dry-run, no action)")
