@@ -44,6 +44,11 @@ BASHRC_MARKER = "# nfchax: NFC readers detected by one_time_setup.py"
 
 UDEV_RULES_PATH = "/etc/udev/rules.d/99-nfc-readers.rules"
 
+SERVICE_NAME = "nfchax-queue"
+SERVICE_PATH = f"/etc/systemd/system/{SERVICE_NAME}.service"
+NFCHAX_ENV_DIR = os.path.expanduser("~/.config/nfchax")
+NFCHAX_ENV_FILE = os.path.join(NFCHAX_ENV_DIR, "env")
+
 WIFI_PM_CONF = "/etc/NetworkManager/conf.d/wifi-power-mgmt.conf"
 # powersave=2 disables power management; default (3) lets the adapter sleep and
 # drop packets, which makes the Pi appear unresponsive over SSH/network.
@@ -305,8 +310,25 @@ def update_bashrc(spec):
     return True
 
 
+def update_nfc_env_file(spec):
+    """Write NFC_READERS to the systemd EnvironmentFile (no 'export' prefix).
+
+    Returns True if the file changed."""
+    os.makedirs(NFCHAX_ENV_DIR, exist_ok=True)
+    content = f"NFC_READERS={spec}\n"
+    try:
+        with open(NFCHAX_ENV_FILE) as f:
+            if f.read() == content:
+                return False
+    except OSError:
+        pass
+    with open(NFCHAX_ENV_FILE, "w") as f:
+        f.write(content)
+    return True
+
+
 def setup_nfc_readers():
-    """Detect connected readers and persist them to ~/.bashrc."""
+    """Detect connected readers and persist them to ~/.bashrc and the service env file."""
     print("Probing serial ports for PN532 readers...")
     readers = probe_readers()
     if readers is None:
@@ -324,6 +346,9 @@ def setup_nfc_readers():
     else:
         print(f"{BASHRC} already has the right NFC_READERS — no change.")
         print(f"  export NFC_READERS={spec}")
+
+    if update_nfc_env_file(spec):
+        print(f"Wrote NFC_READERS to {NFCHAX_ENV_FILE} (used by the systemd service).")
 
 
 def _wifi_interface():
@@ -375,6 +400,68 @@ def disable_wifi_power_management():
     return True
 
 
+def install_systemd_service():
+    """Write /etc/systemd/system/nfchax-queue.service and enable it to start at boot."""
+    try:
+        user = subprocess.check_output(["whoami"], text=True).strip()
+    except Exception:
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "pi"
+
+    service_content = (
+        "[Unit]\n"
+        f"Description=NFC tag to kiosk queue driver (nfchax)\n"
+        "After=local-fs.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"User={user}\n"
+        f"WorkingDirectory={REPO_DIR}\n"
+        f"EnvironmentFile=-{NFCHAX_ENV_FILE}\n"
+        f"ExecStart={VENV_PYTHON} {REPO_DIR}/queue_from_tags.py\n"
+        "Restart=on-failure\n"
+        "RestartSec=5\n"
+        "StandardOutput=journal\n"
+        "StandardError=journal\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+    existing = ""
+    if os.path.exists(SERVICE_PATH):
+        try:
+            result = subprocess.run(["sudo", "cat", SERVICE_PATH],
+                                    capture_output=True, text=True)
+            existing = result.stdout
+        except Exception:
+            pass
+
+    if existing != service_content:
+        result = subprocess.run(
+            ["sudo", "tee", SERVICE_PATH],
+            input=service_content, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"Warning: could not write service file ({result.stderr.strip()})")
+            print(f"  Service file content that would have been written:")
+            print(service_content)
+            return
+        print(f"Installed {SERVICE_PATH}")
+        subprocess.run(["sudo", "systemctl", "daemon-reload"], capture_output=True)
+    else:
+        print(f"{SERVICE_PATH} is up to date — no change.")
+
+    subprocess.run(["sudo", "systemctl", "enable", SERVICE_NAME],
+                   capture_output=True)
+    result = subprocess.run(["sudo", "systemctl", "restart", SERVICE_NAME],
+                            capture_output=True)
+    if result.returncode == 0:
+        print(f"{SERVICE_NAME} service enabled and (re)started.")
+        print(f"  Logs: journalctl -u {SERVICE_NAME} -f")
+    else:
+        print(f"Warning: service restart failed. Check: sudo systemctl status {SERVICE_NAME}")
+
+
 def main():
     bootstrap_venv()  # may re-exec the process under ./venv before continuing
 
@@ -397,6 +484,10 @@ def main():
     print()
     print("Configuring WiFi power management...")
     disable_wifi_power_management()
+
+    print()
+    print("Installing nfchax-queue systemd service...")
+    install_systemd_service()
 
     print()
     print("Done. labwc reads its environment only at startup, so REBOOT (or restart")

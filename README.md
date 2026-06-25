@@ -46,3 +46,39 @@ session) to apply, then relaunch the kiosk:
 
 To revert, remove the `XCURSOR_*` lines from `~/.config/labwc/environment` (or set
 `XCURSOR_THEME=PiXtrix`) and reboot.
+
+## NFC queue service
+
+`one_time_setup.py` also installs and enables a systemd service,
+`nfchax-queue`, that runs `queue_from_tags.py` on boot. The service starts
+automatically at boot and restarts itself if it crashes.
+
+It reads the set of NFC readers from `~/.config/nfchax/env` (written by
+`one_time_setup.py` alongside `~/.bashrc`). If a tag is placed on a reader, the
+service calls `play-video.sh` to update the kiosk queue; removing all tags clears
+the queue and stops playback.
+
+### Service management
+
+```bash
+# Check whether the service is running
+sudo systemctl status nfchax-queue
+
+# Restart after a hardware glitch or config change
+sudo systemctl restart nfchax-queue
+
+# Stop the service (e.g. to run queue_from_tags.py manually)
+sudo systemctl stop nfchax-queue
+```
+
+### Logs
+
+The service writes all output to the systemd journal:
+
+```bash
+# Tail live output
+journalctl -u nfchax-queue -f
+
+# Show the last 100 lines
+journalctl -u nfchax-queue -n 100
+```
