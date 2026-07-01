@@ -14,3 +14,12 @@ user_pref("media.autoplay.block-event.enabled", false);
 user_pref("browser.aboutwelcome.enabled", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
+// Never cache: the player assets are local and edited in place, so a cached
+// youtube-fullscreen.html would silently serve a stale page after a reload.
+user_pref("browser.cache.disk.enable", false);
+// Kiosk must always boot straight to the URL — never a crash-recovery or
+// session-restore page (which would swallow the launch after an unclean exit).
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("toolkit.startup.max_resumed_crashes", -1);
+user_pref("browser.sessionstore.max_tabs_undo", 0);
+user_pref("browser.tabs.crashReporting.sendReport", false);

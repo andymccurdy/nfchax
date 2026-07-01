@@ -92,19 +92,45 @@ The PN532 chip does not report RSSI or signal strength. `InListPassiveTarget`
 only returns UID, SAK, ATQA — no proximity metric. This is a hardware
 limitation, not a library gap.
 
-## Tags store a YouTube video_id
+## Tags store typed content (video or playlist)
 
-Each tag holds a YouTube `video_id` as a **NUL-padded ASCII payload** (not just a
-UID lookup). The on-tag layout is the single source of truth in `tag_payload.py`,
-imported by both the writer and the listener so they can't drift:
+A tag holds a small **newline-delimited ASCII record**, NUL-padded, describing
+what to play. The layout is the single source of truth in `tag_payload.py`,
+imported by the writer and both readers so they can't drift. Two content types:
 
-- 16 bytes, ASCII, NUL-padded (an 11-char id leaves 5 NUL bytes).
+```
+v                 <- video tile          p                 <- playlist tile
+<video_id>                                <playlist_id>
+                                          <sequence 1-4>
+```
+
+- **48 bytes**, ASCII, NUL-padded. (The old 16-byte area held only a video id; a
+  YouTube playlist id is 34–41 chars, so the area was grown.)
 - Tag family auto-detected by **UID length**: 4 bytes → MIFARE Classic (payload
-  in **block 4**, authenticated with the factory default key `FF…FF`); 7 bytes →
-  NTAG2xx (payload in **pages 4–7**).
-- Only data blocks/pages are touched — never sector trailers (Classic) or
-  lock/config pages (NTAG) — so a tag can't be bricked or locked read-only, and
-  is safe to rewrite (~100k-cycle flash endurance).
+  in **blocks 4,5,6**, one auth on block 4 with the factory default key `FF…FF`);
+  7 bytes → NTAG2xx (payload in **pages 4–15**).
+- Only data blocks/pages are touched — never sector trailers (Classic, block 7)
+  or lock/config pages (NTAG) — so a tag can't be bricked or locked read-only,
+  and is safe to rewrite (~100k-cycle flash endurance).
+- **Legacy tags** (bare video id, no `v`/`p` line) decode as a video, so tags
+  written under the old 16-byte format keep working.
+
+### Playlist tiles and rotate-to-skip
+
+A playlist tile is a **square with an NFC tag on each of its four edges** — all
+four hold the same playlist id but sequence `1,2,3,4`. Rotating the tile a
+quarter-turn on the reader changes which edge is read; the reader turns that
+sequence transition into a skip:
+
+- `+1` mod 4 (`1→2→3→4→1`) → **skip forward** one video.
+- `-1` mod 4 (`1→4→3→2→1`) → **skip back** one video.
+- `+2` (180° flip) or `0` (same edge) → ambiguous → ignored.
+
+Skips **wrap** within the playlist (forward off the last video → first; back off
+the first → last). This is intra-playlist navigation only; the outer queue is
+untouched (the queue item carries type+id, never the sequence). See
+`queue_from_tags.py` for how a skip is gated to the head reader, and the player
+section for how the wrap/skip is executed.
 
 ### Writing a tag — `write_tag.py`
 
@@ -114,12 +140,15 @@ with `--device`/`--reset` to write on any reader:
 
 ```bash
 cd ~/nfchax
-./venv/bin/python write_tag.py dQw4w9WgXcQ                              # default reader
-./venv/bin/python write_tag.py --device /dev/ttyUSB0 --reset none ID    # a USB reader, no HAT
+./venv/bin/python write_tag.py dQw4w9WgXcQ                               # a video tile
+./venv/bin/python write_tag.py --type playlist PLxxxx --sequence 1       # one playlist edge
+./venv/bin/python write_tag.py --type playlist PLxxxx --edges            # all 4 edges in turn
+./venv/bin/python write_tag.py --device /dev/ttyUSB0 --reset none ID     # a USB reader, no HAT
 ```
 
-Waits up to 30s (`--timeout`) for a tag, writes the id, then reads it back and
-verifies — a half-write fails loudly instead of leaving a corrupt tag. Calls
+`--edges` prompts you to rotate the tile a quarter-turn between each of the four
+writes. Each write waits up to 30s (`--timeout`) for a tag, then reads it back
+and verifies — a half-write fails loudly instead of leaving a corrupt tag. Calls
 `GPIO.cleanup()` on exit.
 
 ### Reading — `nfc_listener.py`
@@ -129,27 +158,27 @@ cd ~/nfchax
 ./venv/bin/python nfc_listener.py
 ```
 
-Listens on every reader in `NFC_READERS`; on a scan it reads the payload back and prints the
-`video_id`. The payload is read **once per tag placement** (UID debounce), not on
-every poll. A read/auth failure or a blank tag is reported but keeps the reader
-alive. Output format:
+Listens on every reader in `NFC_READERS`; on a scan it reads the payload back and
+prints the decoded content. The payload is read **once per tag placement** (UID
+debounce), not on every poll. A read/auth failure or a blank tag is reported but
+keeps the reader alive. Output format:
 
 ```
 [2026-06-16T23:09:51] reader=ttyAMA0 video_id=dQw4w9WgXcQ
-[2026-06-16T23:10:04] reader=ttyUSB0 uid=ca32b1d5 (no video_id on tag)
+[2026-06-16T23:10:04] reader=ttyUSB0 playlist_id=PLxxxx seq=1
 [2026-06-16T23:10:12] reader=ttyUSB1 uid=047e2e… payload_error=...
 ```
 
-Reading needs no reset pin, so all readers can read; *writing* defaults to the
-first reader but works on any. The listener does **not** yet drive playback — wiring a scan to
-`play-video.sh` / the `/enqueue` API is the remaining seam.
+`nfc_listener.py` is a **diagnostic** tool; `queue_from_tags.py` is what actually
+drives playback from the tags on the readers (don't run both — they can't share
+the same UART).
 
 ## Fullscreen YouTube player (kiosk)
 
 A fullscreen YouTube player shown on the Pi's HDMI-connected monitor, driven by a
-small FIFO **queue** of video ids. The intent is that scanning an NFC tag changes
-what plays — `play-video.sh` is the seam the listener can call, and `serve.py`
-also exposes an HTTP API the listener could hit directly.
+small FIFO **queue** of tiles (videos and playlists). `queue_from_tags.py` drives
+the queue from the tags physically on the readers; `play-video.sh` is the manual
+seam, and `serve.py` owns the queue behind an HTTP API.
 
 ### Components
 
@@ -166,44 +195,83 @@ also exposes an HTTP API the listener could hit directly.
 
 `serve.py` owns the queue and is the **only** writer (one process, guarded by a
 `threading.Lock`, persisted atomically to `queue.json`). This avoids races: the
-browser removes the finished video, while `play-video.sh` / the NFC listener add
-videos — different actors mutating the same queue, funnelled through one process.
-Max queue length is **5** (`MAX_QUEUE`).
+browser removes the finished tile, while `play-video.sh` / `queue_from_tags.py`
+add tiles — different actors mutating the same queue, funnelled through one
+process. Max queue length is **5** tiles (`MAX_QUEUE`; a playlist is one tile).
 
-HTTP API (JSON, `Cache-Control: no-store`):
+Each **stored** queue item is a tile object `{"type": "video"|"playlist", "id"}`.
+Bare id strings are accepted and normalised to video items, so the CLI's
+comma-separated form and any old `queue.json` still work.
+
+**Playlists are expanded server-side** (see the constraints section for *why* —
+YouTube's playlist *embed* fails on this box). `serve.py` scrapes a playlist id's
+video ids from its public playlist page (no API key) and tracks a current
+`index` per playlist. Responses therefore return **resolved** items — a playlist
+tile resolves to the single video the player should show right now:
+
+- video    → `{"type":"video","id":id}`
+- playlist → `{"type":"playlist","id":plid,"video":cur,"index":i,"count":n}`
+
+Expanded playlists live in an in-memory dict (not persisted), pruned when a tile
+leaves the queue — so a removed-then-replaced playlist restarts from its first
+video.
+
+HTTP API (JSON, `Cache-Control: no-store`; queue items in responses are resolved):
 
 | Method + path | Effect |
 |---|---|
-| `GET /queue` | `{"queue": [...]}` |
-| `POST /enqueue` | body = raw id; append one. `409` if already at 5. |
-| `POST /replace` | body = JSON array **or** comma-separated ids; atomically replace whole queue (blanks dropped, capped to 5). |
-| `POST /advance` | remove the head (the just-finished video). |
+| `GET /queue` | `{"queue": [resolved, ...]}` |
+| `POST /enqueue` | body = id, JSON item, or `{"video_id": id}`; append one tile. `409` if already at 5. |
+| `POST /replace` | body = JSON array (items or ids) **or** comma-separated ids; atomically replace whole queue (blanks dropped, capped to 5). |
+| `POST /advance` | the head finished. If the head is a playlist with more videos, step to its next video; otherwise drop the tile. |
+| `POST /skip` | body = `{"action": "next"\|"prev", "playlist_id": id}`; rotate-to-skip **within the head playlist** (wraps around the ends). |
 
-`play-video.sh` uses **`/replace`** (atomic swap). `/enqueue` exists for an
-append-on-scan style NFC flow.
+`play-video.sh` uses **`/replace`** (atomic swap). `queue_from_tags.py` uses
+`/replace` (whole queue from the tags) and `/skip` (rotate-to-skip).
+
+The server owns **all** playlist logic — the player never touches YouTube's
+playlist API. `/skip` (from a tile rotation) and `/advance` (from a video
+ending) both just move the server-side index; the player picks up the new
+resolved video on its next poll and reloads it as a plain single video.
 
 ### How playback tracks the queue (`player/youtube-fullscreen.html`)
 
-The page polls `GET /queue` every 2s and reconciles in `applyQueue()`:
+**The player only ever plays single videos.** It polls `GET /queue` every 500ms
+and reconciles in `applyQueue()`:
 
-- It plays the **head** of the queue. Crucially it only reloads the player when
-  `head !== playingId`. So **replacing the queue with a list whose first id is
-  the currently-playing video continues playback uninterrupted**; a different
-  first id switches the video. (This is intentional — don't "optimise" it into an
-  unconditional `loadVideoById`.)
-- When a video **ends** (`ENDED` event) the page calls `POST /advance` to drop the
-  head, then plays the new head. An `advancing` flag prevents double-advance.
+- The head's video to play is `tileVideo(head)` — a video tile's `id`, or a
+  playlist tile's resolved `video`. It only reloads (`loadVideoById`) when that
+  **video id changes**. So a queue `/replace` whose head is the same playlist at
+  the same index continues uninterrupted, while an advance/skip (which changes
+  the resolved video) loads the next one. (Intentional — don't "optimise" away.)
+- **`ENDED`** or **`onError`** → `POST /advance`. The *server* decides whether
+  that means "next video in this playlist" or "drop the tile" — the player
+  doesn't know or care. An `advancing` flag prevents double-advance.
+- A head playlist tile whose `video` is empty (expansion failed / empty
+  playlist) is skipped via `/advance`.
 - When the queue is **empty**, an opaque black `#end-cover` div covers the screen
   (also hides YouTube's end-screen recommendations). It clears when a video loads.
-- A bottom **overlay** (`#queue-bar`) shows one thumbnail tile per queued video
-  (`img.youtube.com/vi/<id>/mqdefault.jpg`), head highlighted. It flashes in
-  whenever the queue contents change and auto-hides after 5s (`OVERLAY_MS`).
+- A bottom **overlay** (`#queue-bar`) shows one tile per queued item, using the
+  item's current video thumbnail (`img.youtube.com/vi/<id>/mqdefault.jpg`);
+  playlist tiles also show `index+1/count`. Head highlighted; flashes in on any
+  queue change, auto-hides after 5s (`OVERLAY_MS`).
 
 So: first `play-video.sh` call launches Firefox; later calls just replace the
 queue and the already-open page picks it up via polling. No browser remote-control.
 
 ### Why it's built this way (non-obvious constraints)
 
+- **YouTube's *playlist* embed does not work here; single-video embeds do.**
+  Loading a playlist (via `loadPlaylist` or `listType=playlist`) reaches the
+  PLAYING state but the video shows *"An error occurred / Playback ID …"* — the
+  playback backend refuses the playlist-embed media path (localhost/non-public
+  origin, unfixable from our side). Single-video embeds are fine. **So playlists
+  are never embedded as playlists:** `serve.py` scrapes the playlist page for its
+  video ids and plays them one at a time as single videos, tracking the position
+  itself. This also means no YouTube Data API key is needed. (Scraping gets the
+  first ~100 videos of a playlist — enough for a kiosk; deeper pages would need
+  continuation-token handling, not implemented.) Don't "simplify" this back into
+  a real playlist embed — it will break.
 - **Must be served over HTTP, not `file://`.** The YouTube IFrame embed throws
   "error 153 / configuration error" from a `file://` origin, and browsers block
   `fetch()` of local files — both reasons the local web server exists. The
@@ -212,7 +280,8 @@ queue and the already-open page picks it up via polling. No browser remote-contr
   so the rest of the repo (this file, `nfc_listener.py`, the venv) is not
   reachable over HTTP. The queue lives in `~/kiosk-state/` (`KIOSK_STATE_DIR`),
   outside the source tree, so nothing runtime-mutable is in git. Config env:
-  `KIOSK_PORT`, `KIOSK_WEB_ROOT`, `KIOSK_STATE_DIR`.
+  `KIOSK_PORT`, `KIOSK_BIND` (default `127.0.0.1` — loopback only; not
+  LAN-exposed), `KIOSK_WEB_ROOT`, `KIOSK_STATE_DIR`.
 - **Autoplay-with-sound + true fullscreen** normally require a user gesture.
   That's bypassed here because we control the browser launch: `--kiosk` gives
   real fullscreen, and the `~/.kiosk-firefox` profile's `user.js` sets
@@ -222,9 +291,15 @@ queue and the already-open page picks it up via polling. No browser remote-contr
   we own is `user.js`. `play-video.sh` runs `mkdir -p` on the profile and copies
   `kiosk-firefox/user.js` in **when the live profile lacks it**, so the profile
   is reproducible after a wipe or on a fresh Pi. Because it seeds only when
-  missing, editing the repo `user.js` won't update an existing profile until its
-  `user.js` is deleted. Firefox re-applies `user.js` on every startup, so the
-  prefs can't drift once seeded.
+  missing, **editing the repo `user.js` does NOT update an existing live profile**
+  — delete `~/.kiosk-firefox/user.js` (or the whole profile) to re-seed. Firefox
+  re-applies `user.js` on every startup, so the prefs can't drift once seeded.
+  Beyond autoplay, `user.js` disables the disk cache (so an edited
+  `youtube-fullscreen.html` is never served stale after a reload) and disables
+  crash/session-restore (so the kiosk always boots straight to the URL). If the
+  live profile ever gets wedged (e.g. Firefox stops loading the YouTube IFrame
+  API — symptom: the page loads but never polls `/queue`), just wipe and re-seed:
+  `pkill firefox; rm -rf ~/.kiosk-firefox` then run `play-video.sh`/`reload-kiosk.sh`.
 - **No mouse/keyboard on the Pi** — everything is driven from SSH. The page has
   no clickable UI; control is entirely via the queue API.
 - **Embedding-disabled videos** show "video unavailable" — that's the video

@@ -13,6 +13,11 @@
 #   whose first id matches the currently-playing video continues playback
 #   uninterrupted; a different first id switches the video.
 #
+#   The single argument is forwarded verbatim to serve.py's /replace, which also
+#   accepts a JSON array of tile objects (e.g. {"type":"playlist","id":"PL..."}).
+#   queue_from_tags.py uses that form to enqueue playlist tiles; from the CLI the
+#   comma-separated video-id form below is the easy path.
+#
 #   Examples:
 #     play-video.sh dQw4w9WgXcQ
 #     play-video.sh dQw4w9WgXcQ,Y1ujpoDlgRU,9bZkp7q19f0

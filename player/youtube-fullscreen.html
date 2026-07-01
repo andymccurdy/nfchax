@@ -89,6 +89,14 @@
       letter-spacing: .02em;
     }
     .tile.playing .badge { background: #c00; }
+
+    /* Playlist tiles have no known per-video thumbnail until loaded, so the
+       image is hidden and a gradient panel stands in for it. */
+    .tile.playlist img { display: none; }
+    .tile.playlist {
+      height: 94px;
+      background: linear-gradient(135deg, #3a1c71, #d76d77, #ffaf7b);
+    }
   </style>
 </head>
 <body>
@@ -100,18 +108,29 @@
 
   <script>
     // ---- Config -------------------------------------------------------------
-    const QUEUE_URL   = "/queue";       // GET  -> {queue: [...]}
-    const ADVANCE_URL = "/advance";     // POST -> pops the finished head
+    const QUEUE_URL   = "/queue";       // GET  -> {queue:[resolved,...]}
+    const ADVANCE_URL = "/advance";     // POST -> head finished; server decides next
     const POLL_MS     = 500;            // how often to re-read the queue
     const OVERLAY_MS  = 5000;           // how long the queue bar stays visible
     const thumb = (id) => `https://img.youtube.com/vi/${id}/mqdefault.jpg`;
     // ------------------------------------------------------------------------
 
+    // The player ONLY plays single videos. The server resolves each queue tile:
+    // a video tile -> {type:"video", id}; a playlist tile -> {type:"playlist",
+    // id, video, index, count} where `video` is the playlist's CURRENT video.
+    // (YouTube's playlist embed fails on this box, so playlists are expanded to
+    // video ids server-side and played one at a time — see serve.py.) The player
+    // just plays the head's resolved video and POSTs /advance when it ends; the
+    // server moves to the next playlist video or the next tile. Skips move the
+    // server-side index too, so nothing playlist-specific lives here.
     let player;
-    let playingId = null;     // video id currently loaded in the player (queue head)
+    let playingVideo = null;  // video id currently loaded (resolved queue head)
     let lastQueueKey = null;  // serialised last-seen queue, for change detection
     let advancing = false;    // guard so ENDED only advances once
     let overlayTimer = null;
+
+    // The concrete video a resolved tile should play right now.
+    const tileVideo = (item) => item.type === "playlist" ? item.video : item.id;
 
     // --- queue I/O -----------------------------------------------------------
     async function fetchQueue() {
@@ -125,8 +144,7 @@
       }
     }
 
-    // Reconcile UI + playback against a queue snapshot. Safe to call from both
-    // the poll loop and the advance handler.
+    // Reconcile UI + playback against a resolved queue snapshot.
     function applyQueue(q) {
       // 1) Show the overlay whenever the queue contents change.
       const key = JSON.stringify(q);
@@ -136,21 +154,30 @@
         if (q.length > 0) flashOverlay();
       }
 
-      // 2) Make the player match the head of the queue.
+      // 2) Make the player match the head's current video. Reload only when
+      //    that video id changes — so a queue replace whose head is the same
+      //    playlist at the same position keeps playing uninterrupted, while an
+      //    advance/skip (which changes the head video) loads the next one.
       const head = q.length ? q[0] : null;
-      if (head === null) {
-        if (playingId !== null) {
-          playingId = null;
+      const target = head ? tileVideo(head) : null;
+      if (!head) {
+        if (playingVideo !== null) {
+          playingVideo = null;
           try { player.stopVideo(); } catch {}
         }
         setEndCover(true); // empty queue -> black screen
-      } else if (head !== playingId) {
-        playingId = head;
+      } else if (!target) {
+        // A playlist tile that couldn't be expanded (network/empty) — skip it.
+        advance();
+      } else if (target !== playingVideo) {
+        playingVideo = target;
         setEndCover(false);
-        player.loadVideoById(head);
-        player.unMute();
-        player.setVolume(100);
-        player.playVideo();
+        try {
+          player.loadVideoById(target);
+          player.unMute();
+          player.setVolume(100);
+          player.playVideo();
+        } catch { /* player not ready yet; next poll retries */ playingVideo = null; }
       }
     }
 
@@ -159,6 +186,8 @@
       if (q !== null) applyQueue(q);
     }
 
+    // The head video finished (ended or errored). The server advances within the
+    // playlist or drops the tile; we reconcile to whatever it returns.
     async function advance() {
       if (advancing) return;
       advancing = true;
@@ -179,17 +208,22 @@
     function renderQueueBar(q) {
       const bar = document.getElementById("queue-bar");
       bar.innerHTML = "";
-      q.forEach((id, i) => {
+      q.forEach((item, i) => {
+        const isPlaylist = item.type === "playlist";
+        const vid = tileVideo(item);
         const tile = document.createElement("div");
-        tile.className = "tile" + (i === 0 ? " playing" : "");
+        tile.className = "tile" + (i === 0 ? " playing" : "") +
+                         (isPlaylist && !vid ? " playlist" : "");
 
         const img = document.createElement("img");
-        img.src = thumb(id);
-        img.alt = id;
+        if (vid) { img.src = thumb(vid); img.alt = vid; }
 
         const badge = document.createElement("div");
         badge.className = "badge";
-        badge.textContent = i === 0 ? "▶ now" : String(i);
+        const pos = i === 0 ? "▶ now" : String(i);
+        badge.textContent = isPlaylist
+          ? pos + " ▤ " + ((item.index || 0) + 1) + "/" + (item.count || 0)
+          : pos;
 
         tile.append(img, badge);
         bar.appendChild(tile);
@@ -225,7 +259,7 @@
           fs: 1,
           iv_load_policy: 3,
           disablekb: 1,
-          origin: location.origin, // valid web origin required for the embed
+          origin: location.origin,
         },
         events: {
           onReady: () => {
@@ -236,6 +270,7 @@
           onStateChange: (e) => {
             if (e.data === YT.PlayerState.ENDED) advance();
           },
+          onError: () => advance(),     // unplayable video -> next video/tile
         },
       });
     };

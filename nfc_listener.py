@@ -17,7 +17,7 @@ import time
 
 from pn532.uart import PN532_UART
 from readers import get_readers, parse_reader
-from tag_payload import decode_payload, read_payload
+from tag_payload import decode_content, read_payload
 
 POLL_TIMEOUT = 0.5  # seconds per read_passive_target call
 DEBOUNCE_SECONDS = 1.0
@@ -58,14 +58,16 @@ def listen(reader_name, device_path, reset_pin, stop_event):
                 if not is_new_sighting(reader_name, uid.hex()):
                     continue
                 try:
-                    video_id = decode_payload(read_payload(pn532, uid))
+                    content = decode_content(read_payload(pn532, uid))
                 except Exception as exc:
                     emit(reader_name, f"uid={uid.hex()} payload_error={exc}")
                     continue
-                if video_id:
-                    emit(reader_name, f"video_id={video_id}")
+                if content is None:
+                    emit(reader_name, f"uid={uid.hex()} (blank tag)")
+                elif content["type"] == "playlist":
+                    emit(reader_name, f"playlist_id={content['id']} seq={content.get('seq')}")
                 else:
-                    emit(reader_name, f"uid={uid.hex()} (no video_id on tag)")
+                    emit(reader_name, f"video_id={content['id']}")
         except Exception as exc:
             with print_lock:
                 print(f"reader={reader_name} error={exc}", file=sys.stderr, flush=True)
